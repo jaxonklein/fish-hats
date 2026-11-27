@@ -55,6 +55,8 @@
   <label>Smallest fish <input id="sMin" type="range" min="4" max="200" step="1"></label>
   <label>Hat size <input id="sHat" type="range" min="50" max="180" step="5"></label>
   <label>Hat pickiness <input id="sPick" type="range" min="0" max="100" step="5"></label>
+  <label>Show whole camera picture <input id="sFit" type="checkbox"></label>
+  <label id="zoomRow" style="display:none">Camera zoom <input id="sZoom" type="range" min="0" max="100" step="1" value="0"></label>
   <label>Snow <input id="sSnow" type="checkbox"></label>
   <label>Christmas lights <input id="sLights" type="checkbox"></label>
   <label>"Merry Fishmas" banner <input id="sBanner" type="checkbox"></label>
@@ -70,7 +72,8 @@
   <div class="hint">Tap anywhere to open or close this panel.<br>
   Fish missing hats? Lower "Hat pickiness" or raise "Sensitivity".<br>
   Hats on bubbles or plants? Raise "Hat pickiness", or use "Mask bubbles / filter" and paint over them.<br>
-  Camera moved or lights changed? Tap "Relearn tank".</div>
+  Camera moved or lights changed? Tap "Relearn tank".<br>
+  Picture too zoomed in? Turn on "Show whole camera picture", move "Camera zoom" to the left, or tap "Switch camera" to try a wide lens.</div>
 </div>
 
 <script>
@@ -81,9 +84,10 @@ const view = $('#view'), ctx = view.getContext('2d');
 const statusEl = $('#status');
 
 // ---------- settings ----------
-const DEF = { pick: 45, sens: 72, minSize: 24, hat: 100, snow: true, lights: true, banner: true, debug: false };
+const DEF = { pick: 45, sens: 72, minSize: 24, hat: 100, snow: true, lights: true, banner: true, debug: false, fit: true };
 let S = Object.assign({}, DEF);
 try { Object.assign(S, JSON.parse(localStorage.getItem('fishhats.settings') || '{}')); } catch (e) {}
+if (S.fit === undefined) S.fit = true;
 if (!S.v3) { S.minSize = DEF.minSize; S.sens = DEF.sens; S.pick = DEF.pick; S.v3 = true; }
 const saveS = () => { try { localStorage.setItem('fishhats.settings', JSON.stringify(S)); } catch (e) {} };
 
@@ -138,7 +142,7 @@ function resize() {
 }
 function computeMap() {
   if (!srcW) return;
-  const s = Math.max(view.width / srcW, view.height / srcH);
+  const s = (S.fit ? Math.min : Math.max)(view.width / srcW, view.height / srcH);
   map = { s, ox: (view.width - srcW * s) / 2, oy: (view.height - srcH * s) / 2, kx: srcW / PW * s, ky: srcH / PH * s };
 }
 const dX = px => map.ox + px * map.kx;
@@ -679,6 +683,7 @@ function tick(now) {
   // slow phone: when detection costs too much, run it every other frame (drawing stays smooth)
   if (!(procMs > 22 && frameNo % 2)) { const p0 = performance.now(); process(now); procMs = procMs * 0.9 + (performance.now() - p0) * 0.1; }
 
+  if (S.fit) { ctx.fillStyle = '#000'; ctx.fillRect(0, 0, view.width, view.height); }
   ctx.drawImage(source, map.ox, map.oy, srcW * map.s, srcH * map.s);
   if (S.debug) drawDebug();
   if (maskMode) drawMaskOnly();
@@ -697,8 +702,10 @@ async function startCamera() {
   }
   try {
     if (stream) stream.getTracks().forEach(t => t.stop());
-    stream = await navigator.mediaDevices.getUserMedia({ audio: false,
-      video: { facingMode: { ideal: facing }, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } } });
+    const vid = { width: { ideal: 1280 }, height: { ideal: 960 }, frameRate: { ideal: 30 } };
+    if (camId) vid.deviceId = { exact: camId }; else vid.facingMode = { ideal: facing };
+    stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: vid });
+    setupZoom(stream.getVideoTracks()[0]);
     const v = document.createElement('video');
     v.playsInline = true; v.muted = true; v.srcObject = stream;
     await v.play();
@@ -707,6 +714,34 @@ async function startCamera() {
   } catch (e) {
     err.textContent = 'Camera did not start: ' + (e && e.message ? e.message : e);
   }
+}
+// Zoom all the way out when the camera allows it, and offer a zoom slider.
+let camId = null, camTrack = null, zoomCap = null;
+function setupZoom(track) {
+  camTrack = track; zoomCap = null;
+  try { const c = track.getCapabilities ? track.getCapabilities() : {}; if (c.zoom && c.zoom.max > c.zoom.min) zoomCap = c.zoom; } catch (e) {}
+  $('#zoomRow').style.display = zoomCap ? '' : 'none';
+  $('#sZoom').value = 0;
+  if (zoomCap) track.applyConstraints({ advanced: [{ zoom: zoomCap.min }] }).catch(() => {});
+}
+function setZoom(f) {
+  if (!zoomCap || !camTrack) return;
+  const z = zoomCap.min + (zoomCap.max - zoomCap.min) * f * f;
+  camTrack.applyConstraints({ advanced: [{ zoom: z }] }).catch(() => {});
+}
+// "Switch camera" steps through every camera (some phones and tablets list a wide-angle lens separately).
+async function nextCamera() {
+  let cams = [];
+  try { cams = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput'); } catch (e) {}
+  if (cams.length < 2 || !cams[0].deviceId) { camId = null; facing = facing === 'environment' ? 'user' : 'environment'; return startCamera(); }
+  const cur = camTrack && camTrack.getSettings ? camTrack.getSettings().deviceId : camId;
+  const i = cams.findIndex(d => d.deviceId === cur);
+  const nx = cams[(i + 1) % cams.length];
+  camId = nx.deviceId;
+  statusEl.textContent = 'Camera: ' + (nx.label || ('#' + ((i + 1) % cams.length + 1)));
+  setTimeout(() => { if (statusEl.textContent.startsWith('Camera:')) statusEl.textContent = ''; }, 3000);
+  await startCamera();
+  relearn();
 }
 function startVideo(url) {
   const v = document.createElement('video');
@@ -782,7 +817,10 @@ bindCheck('#sSnow', 'snow'); bindCheck('#sLights', 'lights'); bindCheck('#sBanne
 $('#bRelearn').onclick = () => { relearn(); panel.classList.remove('show'); };
 $('#bClose').onclick = () => panel.classList.remove('show');
 $('#bFull').onclick = goFull;
-$('#bFlip').onclick = () => { if (demo) return; facing = facing === 'environment' ? 'user' : 'environment'; startCamera(); };
+$('#bFlip').onclick = () => { if (demo || !stream) return; nextCamera(); };
+bindCheck('#sFit', 'fit'); $('#sFit').addEventListener('change', computeMap);
+let zoomT = 0;
+$('#sZoom').oninput = () => { setZoom(+$('#sZoom').value / 100); clearTimeout(zoomT); zoomT = setTimeout(relearn, 600); };
 $('#bClearMask').onclick = () => { if (mask) { mask.fill(0); saveMask(); } };
 $('#bMask').onclick = () => { maskMode = true; maskErase = false; panel.classList.remove('show'); $('#maskbar').classList.add('show'); setMaskBtns();
   statusEl.textContent = 'Paint over bubbles, filter flow and waving plants'; };
