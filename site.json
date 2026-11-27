@@ -1,0 +1,10 @@
+{
+  "slug": "fishhats",
+  "domain": "fishhats.caladan.build",
+  "brand": "Fish Hats",
+  "repo": "jaxonklein/fish-hats",
+  "contact_to": "hello@fishhats.caladan.build",
+  "dns_zone": "caladan.build",
+  "include_www": false,
+  "contact_mode": "local-brief"
+}

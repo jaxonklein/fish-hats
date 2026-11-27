@@ -44,6 +44,8 @@
   <p>Mount the phone so it looks straight through the tank glass. Keep it still. The page learns the tank, then gives every swimming fish a Christmas hat.</p>
   <button id="goCam">Start camera</button>
   <button id="goDemo" class="alt">Try the demo tank</button>
+  <button id="goVid" class="ghost">Test with a video</button>
+  <input id="vidFile" type="file" accept="video/*" style="display:none">
   <p id="startErr" class="err"></p>
 </div>
 
@@ -87,7 +89,7 @@ const PW = 160;            // processing width (small = fast on old phones)
 let PH = 90, N = PW * PH;
 const proc = document.createElement('canvas');
 const pctx = proc.getContext('2d', { willReadFrequently: true });
-let bgR, bgG, bgB, fg, tmp, fg2, labels, mask, stack, lastFrame;
+let bgR, bgG, bgB, fg, tmp, fg2, labels, mask, stack, lastFrame, busy;
 let samples = [], learning = true, learnFrames = 0, bigFgFrames = 0, lastSample = 0;
 let source = null, srcW = 0, srcH = 0, stream = null, facing = 'environment', demo = null;
 let tracks = [], nextId = 1, blobs = [];
@@ -99,12 +101,12 @@ function allocProc() {
   proc.width = PW; proc.height = PH;
   bgR = new Float32Array(N); bgG = new Float32Array(N); bgB = new Float32Array(N);
   fg = new Uint8Array(N); tmp = new Uint8Array(N); fg2 = new Uint8Array(N);
-  labels = new Int32Array(N); stack = new Int32Array(N);
+  labels = new Int32Array(N); stack = new Int32Array(N); busy = new Float32Array(N);
   mask = loadMask();
   relearn();
 }
 function relearn() {
-  samples = []; learning = true; learnFrames = 0; tracks = []; bigFgFrames = 0;
+  samples = []; learning = true; learnFrames = 0; tracks = []; bigFgFrames = 0; if (busy) busy.fill(0);
 }
 
 // ---------- mask (areas to ignore: bubbler, filter outflow, moving plants) ----------
@@ -170,9 +172,12 @@ function process(now) {
       const df = Math.abs(r - oR - bgR[i]) + Math.abs(g - oG - bgG[i]) + Math.abs(b - oB - bgB[i]);
       f = df > thr ? 1 : 0;
     }
-    fg[i] = f; fgCount += f;
+    fgCount += f;
     const a = f ? 0.0015 : 0.03;           // learn background slowly under fish, faster elsewhere
     bgR[i] += (r - bgR[i]) * a; bgG[i] += (g - bgG[i]) * a; bgB[i] += (b - bgB[i]) * a;
+    // pixels that "move" most of the time are ripples, bubbles or flicker: ignore them
+    busy[i] += (f - busy[i]) * 0.012;
+    fg[i] = busy[i] > 0.28 ? 0 : f;
   }
 
   // whole picture changed: camera bumped or room lights switched
@@ -236,7 +241,8 @@ function findBlobs() {
       if (y < PH - 1 && fg2[p + PW] && !labels[p + PW]) { labels[p + PW] = L; stack[sp++] = p + PW; }
     }
     const w = maxx - minx + 1, h = maxy - miny + 1;
-    if (area < S.minSize || area > maxArea || w < 3 || h < 2) continue;
+    if (area < S.minSize || area > maxArea || w < 3 || h < 3) continue;
+    if (area < w * h * 0.3) continue;          // thin or ragged: an edge or ripple, not a fish body
     // top edge of left half and right half: the hat sits on the head side
     const mid = (minx + maxx) >> 1;
     let topL = maxy, topR = maxy;
@@ -267,6 +273,7 @@ function updateTracks(now) {
     if (tUsed[ti] || bUsed[bi]) continue;
     tUsed[ti] = bUsed[bi] = 1;
     const t = tracks[ti], b = blobs[bi];
+    t.path += Math.hypot(b.x - t.x, b.y - t.y);
     t.vx = t.vx * 0.75 + (b.x - t.x) * 0.25;
     t.vy = t.vy * 0.75 + (b.y - t.y) * 0.25;
     t.x = b.x; t.y = b.y;
@@ -277,10 +284,16 @@ function updateTracks(now) {
     const top = t.dir > 0 ? b.topR : b.topL;
     t.top += (top - t.top) * 0.35;
     t.seen++; t.miss = 0; t.box = b;
+    // confirm a fish once it has swum sideways a real distance (bubbles rise, flicker stays put)
+    // and has a steady path (seen nearly every frame, not zig-zagging like ripple noise)
+    if (!t.ok) { const hx = Math.abs(t.x - t.bx), vy = Math.abs(t.y - t.by), net = Math.hypot(hx, vy);
+      if (t.seen >= 8 && t.seen >= t.age * 0.75 && net > t.path * 0.55 &&
+          hx > Math.max(5, t.size * 0.8) && hx > vy * 0.8) t.ok = true; }
     // a "fish" that never moves is really a ghost in the background: absorb it
     if (Math.hypot(t.x - t.ax, t.y - t.ay) > 4) { t.ax = t.x; t.ay = t.y; t.at = now; }
     else if (now - t.at > 5000) { absorb(b); t.dead = true; }
   }
+  for (const t of tracks) t.age++;
   for (let ti = 0; ti < tracks.length; ti++) {
     if (tUsed[ti]) continue;
     const t = tracks[ti];
@@ -291,7 +304,7 @@ function updateTracks(now) {
     if (bUsed[bi]) continue;
     const b = blobs[bi];
     tracks.push({ id: nextId++, x: b.x, y: b.y, vx: 0, vy: 0, w: b.w, h: b.h, size: Math.sqrt(b.area), top: b.miny, dir: 1,
-      seen: 1, miss: 0, box: b, ax: b.x, ay: b.y, at: now, sx: b.x, sy: b.y,
+      seen: 1, miss: 0, box: b, ax: b.x, ay: b.y, at: now, sx: b.x, sy: b.y, bx: b.x, by: b.y, ok: false, age: 0, path: 0,
       acc: ACCS[(Math.random() * ACCS.length) | 0], phase: Math.random() * 6.28, born: now });
   }
   tracks = tracks.filter(t => !t.dead);
@@ -368,7 +381,7 @@ function roundRect(x, y, w, h, r) {
 }
 
 function drawTrack(t, time) {
-  if (t.seen < 4) return;
+  if (!t.ok) return;
   const alpha = t.miss < 5 ? 1 : Math.max(0, 1 - (t.miss - 5) / 15);
   if (alpha <= 0) return;
   const fade = Math.min(1, (performance.now() - t.born) / 400);
@@ -463,6 +476,7 @@ function drawDebug() {
     const j = i * 4;
     if (mask[i]) { a[j + 2] = 255; a[j + 3] = 90; }
     else if (fg2 && fg2[i]) { a[j] = 255; a[j + 1] = 255; a[j + 3] = 120; }
+    else if (busy && busy[i] > 0.28) { a[j] = 170; a[j + 2] = 255; a[j + 3] = 70; }
   }
   dctx.putImageData(im, 0, 0);
   ctx.imageSmoothingEnabled = false;
@@ -470,13 +484,13 @@ function drawDebug() {
   ctx.imageSmoothingEnabled = true;
   ctx.strokeStyle = '#0f0'; ctx.lineWidth = 2; ctx.font = '14px monospace'; ctx.fillStyle = '#0f0';
   for (const t of tracks) {
-    if (!t.box) continue; const b = t.box;
+    if (!t.box || !t.ok) continue; const b = t.box;
     ctx.strokeRect(dX(b.minx), dY(b.miny), (b.maxx - b.minx + 1) * map.kx, (b.maxy - b.miny + 1) * map.ky);
     ctx.fillText('#' + t.id + (t.dir > 0 ? '→' : '←'), dX(b.minx), dY(b.miny) - 4);
   }
   ctx.fillStyle = 'rgba(0,0,0,.6)'; ctx.fillRect(6, view.height - 30, 250, 24);
   ctx.fillStyle = '#0f0';
-  ctx.fillText(`${fps.toFixed(0)} fps · ${blobs.length} blobs · ${tracks.filter(t => t.seen >= 4).length} hats`, 12, view.height - 13);
+  ctx.fillText(`${fps.toFixed(0)} fps · ${blobs.length} blobs · ${tracks.filter(t => t.ok).length} hats`, 12, view.height - 13);
 }
 function drawMaskOnly() {
   if (dbg.width !== PW || dbg.height !== PH) { dbg.width = PW; dbg.height = PH; }
@@ -489,9 +503,10 @@ function drawMaskOnly() {
 }
 
 // ---------- main loop ----------
-function frame(now) { requestAnimationFrame(frame); tick(now); }
+let testHold = false;
+function frame(now) { requestAnimationFrame(frame); if (!testHold) tick(now); }
 // test hook: step the loop by hand (used when the tab is in the background)
-window.__fishStep = (n, ms = 33) => { let t = performance.now(); for (let i = 0; i < n; i++) tick(t += ms); return tracks.filter(t => t.seen >= 4).length; };
+window.__fishStep = (n, ms = 33) => { let t = performance.now(); for (let i = 0; i < n; i++) tick(t += ms); return tracks.filter(t => t.ok).length; };
 function tick(now) {
   if (!source) return;
   const dt = Math.max(0, Math.min(0.1, (now - lastT) / 1000)); lastT = now;
@@ -532,6 +547,12 @@ async function startCamera() {
   } catch (e) {
     err.textContent = 'Camera did not start: ' + (e && e.message ? e.message : e);
   }
+}
+function startVideo(url) {
+  const v = document.createElement('video');
+  v.playsInline = true; v.muted = true; v.loop = true; v.src = url;
+  v.play().catch(() => {});
+  v.addEventListener('loadeddata', () => { demo = null; source = v; srcW = 0; begin(); }, { once: true });
 }
 function startDemo() { demo = makeDemo(); source = demo.canvas; srcW = 0; begin(); }
 function begin() {
@@ -627,10 +648,16 @@ view.addEventListener('pointermove', e => { if (maskMode && painting) paintAt(e)
 addEventListener('pointerup', () => { painting = false; });
 $('#goCam').onclick = startCamera;
 $('#goDemo').onclick = startDemo;
+$('#goVid').onclick = () => $('#vidFile').click();
+$('#vidFile').onchange = e => { const f = e.target.files[0]; if (f) startVideo(URL.createObjectURL(f)); };
 addEventListener('resize', resize);
 resize();
 requestAnimationFrame(frame);
 if (location.hash === '#demo') startDemo();
+else if (location.hash.startsWith('#video=')) startVideo(decodeURIComponent(location.hash.slice(7)));
+window.__fish = { hold(v) { testHold = v; }, get source() { return source; }, tick: n => tick(n), get tracks() { return tracks; }, get learning() { return learning; },
+  stats() { let f = 0, f2 = 0, m = 0; for (let i = 0; i < N; i++) { f += fg[i]; f2 += fg2[i]; m += mask[i]; }
+    return { PW, PH, fg: f / N, fg2: f2 / N, mask: m / N, blobs: blobs.length, thr: 130 - S.sens, bgMean: bgR.reduce((a, b) => a + b, 0) / N }; } };
 })();
 </script>
 </body>
