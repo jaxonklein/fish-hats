@@ -54,6 +54,7 @@
   <label>Sensitivity <input id="sSens" type="range" min="10" max="110" step="1"></label>
   <label>Smallest fish <input id="sMin" type="range" min="4" max="200" step="1"></label>
   <label>Hat size <input id="sHat" type="range" min="50" max="180" step="5"></label>
+  <label>Hat pickiness <input id="sPick" type="range" min="0" max="100" step="5"></label>
   <label>Snow <input id="sSnow" type="checkbox"></label>
   <label>Christmas lights <input id="sLights" type="checkbox"></label>
   <label>"Merry Fishmas" banner <input id="sBanner" type="checkbox"></label>
@@ -67,7 +68,8 @@
     <button id="bClose">Close</button>
   </div>
   <div class="hint">Tap anywhere to open or close this panel.<br>
-  Hats on bubbles or plants? Use "Mask bubbles / filter" and paint over them.<br>
+  Fish missing hats? Lower "Hat pickiness" or raise "Sensitivity".<br>
+  Hats on bubbles or plants? Raise "Hat pickiness", or use "Mask bubbles / filter" and paint over them.<br>
   Camera moved or lights changed? Tap "Relearn tank".</div>
 </div>
 
@@ -79,10 +81,10 @@ const view = $('#view'), ctx = view.getContext('2d');
 const statusEl = $('#status');
 
 // ---------- settings ----------
-const DEF = { sens: 70, minSize: 30, hat: 100, snow: true, lights: true, banner: true, debug: false };
+const DEF = { pick: 45, sens: 72, minSize: 24, hat: 100, snow: true, lights: true, banner: true, debug: false };
 let S = Object.assign({}, DEF);
 try { Object.assign(S, JSON.parse(localStorage.getItem('fishhats.settings') || '{}')); } catch (e) {}
-if (!S.v2) { S.minSize = Math.max(S.minSize, 30); S.v2 = true; }
+if (!S.v3) { S.minSize = DEF.minSize; S.sens = DEF.sens; S.pick = DEF.pick; S.v3 = true; }
 const saveS = () => { try { localStorage.setItem('fishhats.settings', JSON.stringify(S)); } catch (e) {} };
 
 // ---------- processing state ----------
@@ -427,8 +429,11 @@ function updateTracks(now) {
     // and has a steady path (seen nearly every frame, not zig-zagging like ripple noise)
     if (!t.ok) { const hx = Math.abs(t.x - t.bx), vy = Math.abs(t.y - t.by), net = Math.hypot(hx, vy);
       // fish seen side-on are longer than tall; ripple and glare blobs are roundish
-      if (t.wseen >= 8 && t.wseen >= t.age * 0.8 && net > t.path * 0.55 && t.w >= t.h * 1.2 &&
-          hx > Math.max(5, t.size * 0.8) && hx > vy * 0.5) { t.ok = true; t.okAge = 0; t.okX = t.x; t.okY = t.y; } }
+      // "Hat pickiness" 0 = hat on anything that swims a little, 100 = only clear side-on swimmers
+      const k = S.pick / 100;
+      if (t.wseen >= 4 + 5 * k && t.wseen >= t.age * (0.6 + 0.2 * k) && net > t.path * (0.3 + 0.25 * k) &&
+          t.w >= t.h * (0.9 + 0.3 * k) && hx > Math.max(2 + 3 * k, t.size * (0.3 + 0.5 * k)) && hx > vy * (0.2 + 0.3 * k)) {
+        t.ok = true; t.okAge = 0; t.okX = t.x; t.okY = t.y; } }
     // a "fish" that never moves is really a ghost in the background: absorb it
     if (Math.hypot(t.x - t.ax, t.y - t.ay) > 4) { t.ax = t.x; t.ay = t.y; t.at = now; }
     else if (now - t.at > 5000) { absorb(b); t.dead = true; }
@@ -438,7 +443,7 @@ function updateTracks(now) {
     t.age++;
     if (!t.ok && t.age >= 30) { t.age = 0; t.wseen = 0; t.path = 0; t.bx = t.x; t.by = t.y; }
     // a hat-wearer that has not really gone anywhere for ~3 s is probably flicker: take the hat back
-    if (t.ok && ++t.okAge >= 90) {
+    if (t.ok && ++t.okAge >= 90 + (1 - S.pick / 100) * 150) {
       if (Math.hypot(t.x - t.okX, t.y - t.okY) < Math.max(6, t.size * 1.2)) { t.ok = false; t.age = 0; t.wseen = 0; t.path = 0; t.bx = t.x; t.by = t.y; }
       t.okAge = 0; t.okX = t.x; t.okY = t.y;
     }
@@ -772,7 +777,7 @@ const panel = $('#panel');
 let maskMode = false, maskErase = false, painting = false;
 function bindRange(id, key) { const el = $(id); el.value = S[key]; el.oninput = () => { S[key] = +el.value; saveS(); }; }
 function bindCheck(id, key) { const el = $(id); el.checked = S[key]; el.onchange = () => { S[key] = el.checked; saveS(); }; }
-bindRange('#sSens', 'sens'); bindRange('#sMin', 'minSize'); bindRange('#sHat', 'hat');
+bindRange('#sSens', 'sens'); bindRange('#sMin', 'minSize'); bindRange('#sHat', 'hat'); bindRange('#sPick', 'pick');
 bindCheck('#sSnow', 'snow'); bindCheck('#sLights', 'lights'); bindCheck('#sBanner', 'banner'); bindCheck('#sDebug', 'debug');
 $('#bRelearn').onclick = () => { relearn(); panel.classList.remove('show'); };
 $('#bClose').onclick = () => panel.classList.remove('show');
