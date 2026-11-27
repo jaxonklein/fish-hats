@@ -79,34 +79,37 @@ const view = $('#view'), ctx = view.getContext('2d');
 const statusEl = $('#status');
 
 // ---------- settings ----------
-const DEF = { sens: 70, minSize: 18, hat: 100, snow: true, lights: true, banner: true, debug: false };
+const DEF = { sens: 70, minSize: 30, hat: 100, snow: true, lights: true, banner: true, debug: false };
 let S = Object.assign({}, DEF);
 try { Object.assign(S, JSON.parse(localStorage.getItem('fishhats.settings') || '{}')); } catch (e) {}
+if (!S.v2) { S.minSize = Math.max(S.minSize, 30); S.v2 = true; }
 const saveS = () => { try { localStorage.setItem('fishhats.settings', JSON.stringify(S)); } catch (e) {} };
 
 // ---------- processing state ----------
-const PW = 160;            // processing width (small = fast on old phones)
+let PW = 160;              // processing width; the short side is always 160 (small = fast on old phones)
 let PH = 90, N = PW * PH;
 const proc = document.createElement('canvas');
 const pctx = proc.getContext('2d', { willReadFrequently: true });
-let bgR, bgG, bgB, fg, tmp, fg2, labels, mask, stack, lastFrame, busy;
+let bgR, bgG, bgB, fg, tmp, fg2, labels, mask, stack, lastFrame, busy, bgConf;
 let samples = [], learning = true, learnFrames = 0, bigFgFrames = 0, lastSample = 0;
 let source = null, srcW = 0, srcH = 0, stream = null, facing = 'environment', demo = null;
 let tracks = [], nextId = 1, blobs = [];
-let fps = 0, lastT = performance.now(), frameNo = 0;
+let fps = 0, lastT = performance.now(), frameNo = 0, procMs = 0;
 
 function allocProc() {
-  PH = Math.max(40, Math.round(PW * srcH / srcW));
+  if (srcW >= srcH) { PH = 160; PW = Math.round(160 * srcW / srcH); } else { PW = 160; PH = Math.round(160 * srcH / srcW); }
   N = PW * PH;
   proc.width = PW; proc.height = PH;
   bgR = new Float32Array(N); bgG = new Float32Array(N); bgB = new Float32Array(N);
   fg = new Uint8Array(N); tmp = new Uint8Array(N); fg2 = new Uint8Array(N);
   labels = new Int32Array(N); stack = new Int32Array(N); busy = new Float32Array(N);
+  curGray = new Float32Array(N); warped = new Float32Array(N * 4); valid = new Uint8Array(N); bgGrad = new Float32Array(N); bgConf = new Uint16Array(N);
   mask = loadMask();
   relearn();
 }
 function relearn() {
   samples = []; learning = true; learnFrames = 0; tracks = []; bigFgFrames = 0; if (busy) busy.fill(0);
+  learnRef = null; T = [1, 0, 0, 0]; alignFails = 0;
 }
 
 // ---------- mask (areas to ignore: bubbler, filter outflow, moving plants) ----------
@@ -140,24 +143,152 @@ const dX = px => map.ox + px * map.kx;
 const dY = py => map.oy + py * map.ky;
 
 // ---------- background model + detection ----------
+// ---------- camera-shake alignment ----------
+// The background lives in "reference" coordinates. Each frame we find the similarity
+// transform T (scale/rotation a,b and shift tx,ty) that maps reference -> current frame,
+// by matching small textured blocks, then resample the frame back into reference coords.
+let T = [1, 0, 0, 0], refGray, curGray, blocks = [], warped, valid, bgGrad, alignFails = 0, alignInfo = { n: 0, ok: 0 };
+const BS = 10, SR = 8;        // block size, search radius (processing pixels)
+function toGray(d, out) { for (let i = 0, j = 0; i < N; i++, j += 4) out[i] = (d[j] + 2 * d[j + 1] + d[j + 2]) * 0.25; }
+function pickBlocks(g) {
+  const cand = [], m = SR + 2;
+  for (let by = m; by + BS + m < PH; by += 12) for (let bx = m; bx + BS + m < PW; bx += 12) {
+    let sc = 0;
+    for (let v = 0; v < BS; v++) for (let u = 0; u < BS - 1; u++) {
+      const i = (by + v) * PW + bx + u;
+      if (mask[i]) { sc = -1e9; }
+      sc += Math.abs(g[i + 1] - g[i]) + Math.abs(g[i + PW] - g[i]);
+    }
+    if (busy) { let bz = 0; for (let v = 0; v < BS; v += 3) for (let u = 0; u < BS; u += 3) bz += busy[(by + v) * PW + bx + u]; if (bz > 2) sc *= 0.2; }
+    cand.push([sc, bx, by]);
+  }
+  cand.sort((p, q) => q[0] - p[0]);
+  blocks = cand.slice(0, 45).filter(c => c[0] > BS * BS * 3).map(c => [c[1], c[2]]);
+}
+function align(ref, cur, T0) {
+  const src = [], dst = [];
+  const [a0, b0, tx0, ty0] = T0;
+  for (const [bx, by] of blocks) {
+    const cx = bx + BS / 2, cy = by + BS / 2;
+    const px = a0 * cx - b0 * cy + tx0, py = b0 * cx + a0 * cy + ty0;
+    const ix = Math.round(px - BS / 2), iy = Math.round(py - BS / 2);
+    if (ix - SR < 0 || iy - SR < 0 || ix + BS + SR >= PW || iy + BS + SR >= PH) continue;
+    const cost = new Float32Array((2 * SR + 1) * (2 * SR + 1));
+    let best = 1e18, bdx = 0, bdy = 0;
+    for (let dy = -SR; dy <= SR; dy++) for (let dx = -SR; dx <= SR; dx++) {
+      let sad = 0;
+      for (let v = 0; v < BS; v++) {
+        const r0 = (by + v) * PW + bx, c0 = (iy + dy + v) * PW + ix + dx;
+        for (let u = 0; u < BS; u++) sad += Math.abs(ref[r0 + u] - cur[c0 + u]);
+        if (sad > best) break;
+      }
+      cost[(dy + SR) * (2 * SR + 1) + dx + SR] = sad;
+      if (sad < best) { best = sad; bdx = dx; bdy = dy; }
+    }
+    if (Math.abs(bdx) === SR || Math.abs(bdy) === SR) continue;     // hit the edge of the search: unreliable
+    const W = 2 * SR + 1, k = (bdy + SR) * W + bdx + SR;
+    const sub = (l, c, r) => { const den = l - 2 * c + r; return den > 0 ? 0.5 * (l - r) / den : 0; };
+    const sx = sub(cost[k - 1], best, cost[k + 1]), sy = sub(cost[k - W], best, cost[k + W]);
+    src.push(cx, cy); dst.push(ix + bdx + BS / 2 + sx, iy + bdy + BS / 2 + sy);
+  }
+  alignInfo.n = src.length / 2;
+  if (src.length < 16) return null;
+  // robust least-squares similarity fit, dropping blocks that disagree (fish, ripples)
+  let use = new Uint8Array(src.length / 2).fill(1), Tn = null;
+  for (let it = 0; it < 4; it++) {
+    let n = 0, mx = 0, my = 0, mu = 0, mv = 0;
+    for (let q = 0; q < use.length; q++) if (use[q]) { n++; mx += src[2 * q]; my += src[2 * q + 1]; mu += dst[2 * q]; mv += dst[2 * q + 1]; }
+    if (n < 8) return null;
+    mx /= n; my /= n; mu /= n; mv /= n;
+    let sxx = 0, sa = 0, sb = 0;
+    for (let q = 0; q < use.length; q++) if (use[q]) {
+      const x = src[2 * q] - mx, y = src[2 * q + 1] - my, u = dst[2 * q] - mu, v = dst[2 * q + 1] - mv;
+      sxx += x * x + y * y; sa += x * u + y * v; sb += x * v - y * u;
+    }
+    const a = sa / sxx, b = sb / sxx;
+    Tn = [a, b, mu - (a * mx - b * my), mv - (b * mx + a * my)];
+    const res = [];
+    for (let q = 0; q < use.length; q++) {
+      const x = src[2 * q], y = src[2 * q + 1];
+      res.push(Math.hypot(Tn[0] * x - Tn[1] * y + Tn[2] - dst[2 * q], Tn[1] * x + Tn[0] * y + Tn[3] - dst[2 * q + 1]));
+    }
+    const sorted = res.filter((r, q) => use[q]).sort((p, q) => p - q);
+    const lim = Math.max(0.8, sorted[sorted.length >> 1] * 2.5);
+    for (let q = 0; q < use.length; q++) use[q] = res[q] <= lim ? 1 : 0;
+  }
+  alignInfo.ok = use.reduce((p, q) => p + q, 0);
+  return alignInfo.ok >= 8 ? Tn : null;
+}
+// resample current frame d into reference coords; valid[i]=0 where it falls outside the picture
+function warpInto(d, Tm, out) {
+  const [a, b, tx, ty] = Tm;
+  for (let y = 0, i = 0; y < PH; y++) for (let x = 0; x < PW; x++, i++) {
+    const u = a * x - b * y + tx, v = b * x + a * y + ty;
+    if (u < 2 || v < 2 || u >= PW - 3 || v >= PH - 3) { valid[i] = 0; continue; }
+    valid[i] = 1;
+    const x0 = u | 0, y0 = v | 0, fx = u - x0, fy = v - y0, j = (y0 * PW + x0) * 4, o = i * 4;
+    for (let ch = 0; ch < 3; ch++) {
+      const p00 = d[j + ch], p10 = d[j + 4 + ch], p01 = d[j + PW * 4 + ch], p11 = d[j + PW * 4 + 4 + ch];
+      out[o + ch] = (p00 + (p10 - p00) * fx) * (1 - fy) + (p01 + (p11 - p01) * fx) * fy;
+    }
+  }
+}
+function computeBgGrad() {
+  for (let y = 1; y < PH - 1; y++) for (let x = 1; x < PW - 1; x++) {
+    const i = y * PW + x;
+    const g = k => bgR[k] + bgG[k] + bgB[k];
+    bgGrad[i] = Math.max(Math.abs(g(i + 1) - g(i - 1)), Math.abs(g(i + PW) - g(i - PW))) * 0.5;
+  }
+  const bg4 = new Float32Array(N); for (let i = 0; i < N; i++) bg4[i] = (bgR[i] + 2 * bgG[i] + bgB[i]) * 0.25;
+  refGray = bg4; pickBlocks(refGray);
+}
+const refToCur = (x, y) => [T[0] * x - T[1] * y + T[2], T[1] * x + T[0] * y + T[3]];
+function curToRef(u, v) { const [a, b, tx, ty] = T, k = a * a + b * b, du = u - tx, dv = v - ty; return [(a * du + b * dv) / k, (a * dv - b * du) / k]; }
+
+// ---------- background model + detection ----------
+let learnRef = null, learnT = [1, 0, 0, 0];
 function process(now) {
   pctx.drawImage(source, 0, 0, PW, PH);
-  const d = pctx.getImageData(0, 0, PW, PH).data;
-  lastFrame = d;
+  const raw = pctx.getImageData(0, 0, PW, PH).data;
+  toGray(raw, curGray);
 
   if (learning) {
     learnFrames++;
     // sample spread over ~4 s so every fish has swum away from most samples
-    if (now - lastSample > 260) { lastSample = now; samples.push(new Uint8ClampedArray(d)); }
-    statusEl.textContent = 'Learning the tank… keep the phone still (' + Math.min(100, Math.round(samples.length / 15 * 100)) + '%)';
-    if (samples.length >= 15) buildMedian();
+    if (now - lastSample > 260) {
+      lastSample = now;
+      if (!learnRef) {                      // first sample sets the reference frame
+        learnRef = Float32Array.from(curGray); pickBlocks(learnRef); learnT = [1, 0, 0, 0];
+        samples.push({ d: new Float32Array(N * 4).map((_, k) => raw[k]), v: new Uint8Array(N).fill(1) });
+      } else {
+        const Tm = align(learnRef, curGray, learnT);
+        if (Tm) {
+          learnT = Tm;
+          const w = new Float32Array(N * 4); warpInto(raw, Tm, w);
+          samples.push({ d: w, v: Uint8Array.from(valid) });
+        }
+      }
+    }
+    statusEl.textContent = 'Learning the tank… (' + Math.min(100, Math.round(samples.length / 15 * 100)) + '%)';
+    if (samples.length >= 15) { buildMedian(); T = learnT.slice(); computeBgGrad(); }
     return;
   }
+
+  // follow the camera: where is the reference scene in this frame?
+  const Tm = align(refGray, curGray, T);
+  if (!Tm) {
+    if (++alignFails > 45) relearn();
+    tracksCoast(); statusEl.textContent = ''; return;
+  }
+  alignFails = 0; T = Tm;
+  if (Math.abs(T[2]) > PW * 0.35 || Math.abs(T[3]) > PH * 0.35 || Math.abs(Math.hypot(T[0], T[1]) - 1) > 0.2) { relearn(); return; }
+  warpInto(raw, T, warped);
+  const d = warped; lastFrame = d;
 
   // global brightness offset (phone auto-exposure drifts as fish pass)
   let sr = 0, sg = 0, sb = 0, c = 0;
   for (let i = 0; i < N; i += 3) {
-    if (mask[i]) continue; const j = i * 4;
+    if (mask[i] || !valid[i]) continue; const j = i * 4;
     sr += d[j] - bgR[i]; sg += d[j + 1] - bgG[i]; sb += d[j + 2] - bgB[i]; c++;
   }
   const oR = c ? sr / c : 0, oG = c ? sg / c : 0, oB = c ? sb / c : 0;
@@ -165,22 +296,27 @@ function process(now) {
   const thr = 130 - S.sens;
   let fgCount = 0;
   for (let i = 0; i < N; i++) {
+    if (!valid[i]) { fg[i] = 0; continue; }
     const j = i * 4;
     const r = d[j], g = d[j + 1], b = d[j + 2];
     let f = 0;
-    if (!mask[i]) {
+    const known = bgConf[i] >= 25;         // area just came into view: learn it before judging it
+    if (bgConf[i] < 65535) bgConf[i]++;
+    if (!mask[i] && known) {
       const df = Math.abs(r - oR - bgR[i]) + Math.abs(g - oG - bgG[i]) + Math.abs(b - oB - bgB[i]);
-      f = df > thr ? 1 : 0;
+      // near sharp edges a small alignment error looks like change: ask for more there
+      f = df > thr + bgGrad[i] * 1.6 ? 1 : 0;
     }
     fgCount += f;
-    const a = f ? 0.0015 : 0.03;           // learn background slowly under fish, faster elsewhere
+    const a = !known ? 0.15 : f ? 0.0015 : 0.03;   // learn background slowly under fish, faster elsewhere
     bgR[i] += (r - bgR[i]) * a; bgG[i] += (g - bgG[i]) * a; bgB[i] += (b - bgB[i]) * a;
     // pixels that "move" most of the time are ripples, bubbles or flicker: ignore them
     busy[i] += (f - busy[i]) * 0.012;
     fg[i] = busy[i] > 0.28 ? 0 : f;
   }
+  if (frameNo % 30 === 0) computeBgGrad();
 
-  // whole picture changed: camera bumped or room lights switched
+  // whole picture changed: camera bumped hard or room lights switched
   if (fgCount > N * 0.4) { if (++bigFgFrames > 25) { relearn(); return; } } else bigFgFrames = 0;
 
   // close small gaps in each fish: dilate then erode (3x3)
@@ -189,18 +325,21 @@ function process(now) {
   updateTracks(now);
   statusEl.textContent = '';
 }
+function tracksCoast() { blobs = []; updateTracks(performance.now()); }
 
 function buildMedian() {
-  const k = samples.length, mid = k >> 1, v = new Array(k);
+  const k = samples.length, v = [];
   for (let i = 0; i < N; i++) {
     const j = i * 4;
     for (let ch = 0; ch < 3; ch++) {
-      for (let s = 0; s < k; s++) v[s] = samples[s][j + ch];
-      v.sort((a, b) => a - b);
-      (ch === 0 ? bgR : ch === 1 ? bgG : bgB)[i] = v[mid];
+      v.length = 0;
+      for (let q = 0; q < k; q++) if (samples[q].v[i]) v.push(samples[q].d[j + ch]);
+      v.sort((p, q) => p - q);
+      (ch === 0 ? bgR : ch === 1 ? bgG : bgB)[i] = v.length ? v[v.length >> 1] : 0;
     }
+    bgConf[i] = v.length >= 5 ? 1000 : 0;
   }
-  samples = []; learning = false;
+  samples = []; learning = false; learnRef = null;
 }
 
 function morph(src, dst, dilate) {
@@ -283,17 +422,27 @@ function updateTracks(now) {
     if (t.vx > 0.15) t.dir = 1; else if (t.vx < -0.15) t.dir = -1;
     const top = t.dir > 0 ? b.topR : b.topL;
     t.top += (top - t.top) * 0.35;
-    t.seen++; t.miss = 0; t.box = b;
+    t.seen++; t.wseen++; t.miss = 0; t.box = b;
     // confirm a fish once it has swum sideways a real distance (bubbles rise, flicker stays put)
     // and has a steady path (seen nearly every frame, not zig-zagging like ripple noise)
     if (!t.ok) { const hx = Math.abs(t.x - t.bx), vy = Math.abs(t.y - t.by), net = Math.hypot(hx, vy);
-      if (t.seen >= 8 && t.seen >= t.age * 0.75 && net > t.path * 0.55 &&
-          hx > Math.max(5, t.size * 0.8) && hx > vy * 0.8) t.ok = true; }
+      // fish seen side-on are longer than tall; ripple and glare blobs are roundish
+      if (t.wseen >= 8 && t.wseen >= t.age * 0.8 && net > t.path * 0.55 && t.w >= t.h * 1.2 &&
+          hx > Math.max(5, t.size * 0.8) && hx > vy * 0.5) { t.ok = true; t.okAge = 0; t.okX = t.x; t.okY = t.y; } }
     // a "fish" that never moves is really a ghost in the background: absorb it
     if (Math.hypot(t.x - t.ax, t.y - t.ay) > 4) { t.ax = t.x; t.ay = t.y; t.at = now; }
     else if (now - t.at > 5000) { absorb(b); t.dead = true; }
   }
-  for (const t of tracks) t.age++;
+  // judge "is it a fish?" over a rolling ~1 s window, so one turn or overlap does not rule it out for good
+  for (const t of tracks) {
+    t.age++;
+    if (!t.ok && t.age >= 30) { t.age = 0; t.wseen = 0; t.path = 0; t.bx = t.x; t.by = t.y; }
+    // a hat-wearer that has not really gone anywhere for ~3 s is probably flicker: take the hat back
+    if (t.ok && ++t.okAge >= 90) {
+      if (Math.hypot(t.x - t.okX, t.y - t.okY) < Math.max(6, t.size * 1.2)) { t.ok = false; t.age = 0; t.wseen = 0; t.path = 0; t.bx = t.x; t.by = t.y; }
+      t.okAge = 0; t.okX = t.x; t.okY = t.y;
+    }
+  }
   for (let ti = 0; ti < tracks.length; ti++) {
     if (tUsed[ti]) continue;
     const t = tracks[ti];
@@ -304,7 +453,7 @@ function updateTracks(now) {
     if (bUsed[bi]) continue;
     const b = blobs[bi];
     tracks.push({ id: nextId++, x: b.x, y: b.y, vx: 0, vy: 0, w: b.w, h: b.h, size: Math.sqrt(b.area), top: b.miny, dir: 1,
-      seen: 1, miss: 0, box: b, ax: b.x, ay: b.y, at: now, sx: b.x, sy: b.y, bx: b.x, by: b.y, ok: false, age: 0, path: 0,
+      seen: 1, miss: 0, box: b, ax: b.x, ay: b.y, at: now, sx: b.x, sy: b.y, bx: b.x, by: b.y, ok: false, age: 0, path: 0, wseen: 1,
       acc: ACCS[(Math.random() * ACCS.length) | 0], phase: Math.random() * 6.28, born: now });
   }
   tracks = tracks.filter(t => !t.dead);
@@ -386,14 +535,16 @@ function drawTrack(t, time) {
   if (alpha <= 0) return;
   const fade = Math.min(1, (performance.now() - t.born) / 400);
   const fishH = t.h * map.ky;
-  let s = t.size * map.kx * 0.85 * (S.hat / 100);
+  let s = Math.max(t.size * 0.85, t.w * 0.5) * map.kx * (S.hat / 100);
   s = Math.max(14, Math.min(220, s));
-  const hx = dX(t.sx + t.dir * t.w * 0.2), hy = dY(t.sy) + s * 0.14;
+  const [hu, hv] = refToCur(t.sx + t.dir * t.w * 0.2, t.sy);
+  const hx = dX(hu), hy = dY(hv) + s * 0.14;
   ctx.save();
   ctx.globalAlpha = alpha * fade;
   if (t.acc === 'reindeer') {
     // red glowing nose at the front of the fish
-    const nx = dX(t.x + t.dir * t.w * 0.5), ny = dY(t.y);
+    const [nu, nv] = refToCur(t.x + t.dir * t.w * 0.5, t.y);
+    const nx = dX(nu), ny = dY(nv);
     const r = Math.max(4, fishH * 0.13);
     ctx.shadowColor = '#ff2020'; ctx.shadowBlur = r * (1.5 + Math.sin(time * 4 + t.phase));
     ctx.fillStyle = '#ff2a2a'; ctx.beginPath(); ctx.arc(nx, ny, r, 0, 6.283); ctx.fill();
@@ -479,27 +630,30 @@ function drawDebug() {
     else if (busy && busy[i] > 0.28) { a[j] = 170; a[j + 2] = 255; a[j + 3] = 70; }
   }
   dctx.putImageData(im, 0, 0);
-  ctx.imageSmoothingEnabled = false;
-  ctx.drawImage(dbg, map.ox, map.oy, PW * map.kx, PH * map.ky);
-  ctx.imageSmoothingEnabled = true;
+  drawRefLayer();
   ctx.strokeStyle = '#0f0'; ctx.lineWidth = 2; ctx.font = '14px monospace'; ctx.fillStyle = '#0f0';
   for (const t of tracks) {
     if (!t.box || !t.ok) continue; const b = t.box;
-    ctx.strokeRect(dX(b.minx), dY(b.miny), (b.maxx - b.minx + 1) * map.kx, (b.maxy - b.miny + 1) * map.ky);
-    ctx.fillText('#' + t.id + (t.dir > 0 ? '→' : '←'), dX(b.minx), dY(b.miny) - 4);
+    const [u0, v0] = refToCur(b.minx, b.miny);
+    ctx.strokeRect(dX(u0), dY(v0), (b.maxx - b.minx + 1) * map.kx, (b.maxy - b.miny + 1) * map.ky);
+    ctx.fillText('#' + t.id + (t.dir > 0 ? '→' : '←'), dX(u0), dY(v0) - 4);
   }
-  ctx.fillStyle = 'rgba(0,0,0,.6)'; ctx.fillRect(6, view.height - 30, 250, 24);
+  ctx.fillStyle = 'rgba(0,0,0,.6)'; ctx.fillRect(6, view.height - 30, 470, 24);
   ctx.fillStyle = '#0f0';
-  ctx.fillText(`${fps.toFixed(0)} fps · ${blobs.length} blobs · ${tracks.filter(t => t.ok).length} hats`, 12, view.height - 13);
+  ctx.fillText(`${fps.toFixed(0)} fps · detect ${procMs.toFixed(0)} ms · ${blobs.length} blobs · ${tracks.filter(t => t.ok).length} hats · align ${alignInfo.ok}/${alignInfo.n}`, 12, view.height - 13);
+}
+function drawRefLayer() {
+  ctx.save();
+  ctx.setTransform(map.kx * T[0], map.ky * T[1], -map.kx * T[1], map.ky * T[0], map.ox + map.kx * T[2], map.oy + map.ky * T[3]);
+  ctx.imageSmoothingEnabled = false; ctx.drawImage(dbg, 0, 0);
+  ctx.restore();
 }
 function drawMaskOnly() {
   if (dbg.width !== PW || dbg.height !== PH) { dbg.width = PW; dbg.height = PH; }
   const im = dctx.createImageData(PW, PH), a = im.data;
   for (let i = 0; i < N; i++) if (mask[i]) { a[i * 4 + 2] = 255; a[i * 4] = 40; a[i * 4 + 3] = 130; }
   dctx.putImageData(im, 0, 0);
-  ctx.imageSmoothingEnabled = false;
-  ctx.drawImage(dbg, map.ox, map.oy, PW * map.kx, PH * map.ky);
-  ctx.imageSmoothingEnabled = true;
+  drawRefLayer();
 }
 
 // ---------- main loop ----------
@@ -517,7 +671,8 @@ function tick(now) {
   if (!w || !h) return;
   if (w !== srcW || h !== srcH) { srcW = w; srcH = h; allocProc(); computeMap(); }
   frameNo++;
-  process(now);
+  // slow phone: when detection costs too much, run it every other frame (drawing stays smooth)
+  if (!(procMs > 22 && frameNo % 2)) { const p0 = performance.now(); process(now); procMs = procMs * 0.9 + (performance.now() - p0) * 0.1; }
 
   ctx.drawImage(source, map.ox, map.oy, srcW * map.s, srcH * map.s);
   if (S.debug) drawDebug();
@@ -632,7 +787,7 @@ $('#mDone').onclick = () => { maskMode = false; $('#maskbar').classList.remove('
 function setMaskBtns() { $('#mPaint').className = maskErase ? 'ghost' : 'alt'; $('#mErase').className = maskErase ? 'alt' : 'ghost'; }
 function paintAt(e) {
   const r = view.getBoundingClientRect(), sx = view.width / r.width, sy = view.height / r.height;
-  const px = ((e.clientX - r.left) * sx - map.ox) / map.kx, py = ((e.clientY - r.top) * sy - map.oy) / map.ky;
+  const [px, py] = curToRef(((e.clientX - r.left) * sx - map.ox) / map.kx, ((e.clientY - r.top) * sy - map.oy) / map.ky);
   const rad = 5;
   for (let y = Math.floor(py - rad); y <= py + rad; y++) for (let x = Math.floor(px - rad); x <= px + rad; x++) {
     if (x < 0 || y < 0 || x >= PW || y >= PH) continue;
