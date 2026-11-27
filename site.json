@@ -6,5 +6,7 @@
   "contact_to": "hello@fishhats.caladan.build",
   "dns_zone": "caladan.build",
   "include_www": false,
-  "contact_mode": "local-brief"
+  "contact_mode": "local-brief",
+  "key_uuid": "bkjxjf3fsikizipmusjjyis8",
+  "app_uuid": "f6nzvyyzjvmutewczwn0wqiw"
 }
