@@ -1,0 +1,637 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="theme-color" content="#000000">
+<title>Fish Hats</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,-apple-system,Roboto,sans-serif;color:#fff;touch-action:none;user-select:none;-webkit-user-select:none}
+  #view{position:fixed;inset:0;width:100vw;height:100vh;display:block}
+  #start{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;background:radial-gradient(circle at 50% 40%,#11553f,#021a12);text-align:center;padding:16px;z-index:5}
+  #start h1{margin:0;font-size:2.4rem}
+  #start p{margin:0;max-width:30rem;opacity:.85;line-height:1.4}
+  #start .err{color:#ffb4b4}
+  button{font:inherit;border:0;border-radius:12px;padding:14px 22px;background:#c62828;color:#fff;font-size:1.1rem;cursor:pointer}
+  button.alt{background:#2e7d32}
+  button.ghost{background:#37474f}
+  #panel{position:fixed;left:8px;right:8px;bottom:8px;max-width:440px;margin:0 auto;background:rgba(0,0,0,.82);border-radius:14px;padding:14px 16px;display:none;max-height:82vh;overflow:auto;z-index:4;touch-action:pan-y}
+  #panel.show{display:block}
+  #panel h2{margin:0 0 6px;font-size:1.1rem}
+  #panel label{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:10px 0;font-size:.95rem}
+  #panel input[type=range]{flex:1;max-width:60%}
+  #panel input[type=checkbox]{width:22px;height:22px}
+  #panel .row{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+  #panel .row button{padding:10px 12px;font-size:.92rem;flex:1 1 40%}
+  #panel .hint{font-size:.8rem;opacity:.7;margin-top:10px;line-height:1.35}
+  #status{position:fixed;top:12px;left:0;right:0;text-align:center;font-size:1.05rem;text-shadow:0 1px 4px #000,0 0 2px #000;pointer-events:none;z-index:3}
+  #maskbar{position:fixed;top:44px;left:0;right:0;display:none;justify-content:center;gap:8px;z-index:4}
+  #maskbar.show{display:flex}
+  #maskbar button{padding:10px 14px;font-size:.95rem}
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+<div id="status"></div>
+<div id="maskbar">
+  <button id="mPaint" class="alt">Paint</button>
+  <button id="mErase" class="ghost">Erase</button>
+  <button id="mDone">Done</button>
+</div>
+
+<div id="start">
+  <h1>🎅 Fish Hats 🐟</h1>
+  <p>Mount the phone so it looks straight through the tank glass. Keep it still. The page learns the tank, then gives every swimming fish a Christmas hat.</p>
+  <button id="goCam">Start camera</button>
+  <button id="goDemo" class="alt">Try the demo tank</button>
+  <p id="startErr" class="err"></p>
+</div>
+
+<div id="panel">
+  <h2>Settings</h2>
+  <label>Sensitivity <input id="sSens" type="range" min="10" max="110" step="1"></label>
+  <label>Smallest fish <input id="sMin" type="range" min="4" max="200" step="1"></label>
+  <label>Hat size <input id="sHat" type="range" min="50" max="180" step="5"></label>
+  <label>Snow <input id="sSnow" type="checkbox"></label>
+  <label>Christmas lights <input id="sLights" type="checkbox"></label>
+  <label>"Merry Fishmas" banner <input id="sBanner" type="checkbox"></label>
+  <label>Show detection (debug) <input id="sDebug" type="checkbox"></label>
+  <div class="row">
+    <button id="bRelearn" class="alt">Relearn tank</button>
+    <button id="bMask" class="ghost">Mask bubbles / filter</button>
+    <button id="bClearMask" class="ghost">Clear mask</button>
+    <button id="bFlip" class="ghost">Switch camera</button>
+    <button id="bFull" class="ghost">Full screen</button>
+    <button id="bClose">Close</button>
+  </div>
+  <div class="hint">Tap anywhere to open or close this panel.<br>
+  Hats on bubbles or plants? Use "Mask bubbles / filter" and paint over them.<br>
+  Camera moved or lights changed? Tap "Relearn tank".</div>
+</div>
+
+<script>
+(() => {
+'use strict';
+const $ = s => document.querySelector(s);
+const view = $('#view'), ctx = view.getContext('2d');
+const statusEl = $('#status');
+
+// ---------- settings ----------
+const DEF = { sens: 70, minSize: 18, hat: 100, snow: true, lights: true, banner: true, debug: false };
+let S = Object.assign({}, DEF);
+try { Object.assign(S, JSON.parse(localStorage.getItem('fishhats.settings') || '{}')); } catch (e) {}
+const saveS = () => { try { localStorage.setItem('fishhats.settings', JSON.stringify(S)); } catch (e) {} };
+
+// ---------- processing state ----------
+const PW = 160;            // processing width (small = fast on old phones)
+let PH = 90, N = PW * PH;
+const proc = document.createElement('canvas');
+const pctx = proc.getContext('2d', { willReadFrequently: true });
+let bgR, bgG, bgB, fg, tmp, fg2, labels, mask, stack, lastFrame;
+let samples = [], learning = true, learnFrames = 0, bigFgFrames = 0, lastSample = 0;
+let source = null, srcW = 0, srcH = 0, stream = null, facing = 'environment', demo = null;
+let tracks = [], nextId = 1, blobs = [];
+let fps = 0, lastT = performance.now(), frameNo = 0;
+
+function allocProc() {
+  PH = Math.max(40, Math.round(PW * srcH / srcW));
+  N = PW * PH;
+  proc.width = PW; proc.height = PH;
+  bgR = new Float32Array(N); bgG = new Float32Array(N); bgB = new Float32Array(N);
+  fg = new Uint8Array(N); tmp = new Uint8Array(N); fg2 = new Uint8Array(N);
+  labels = new Int32Array(N); stack = new Int32Array(N);
+  mask = loadMask();
+  relearn();
+}
+function relearn() {
+  samples = []; learning = true; learnFrames = 0; tracks = []; bigFgFrames = 0;
+}
+
+// ---------- mask (areas to ignore: bubbler, filter outflow, moving plants) ----------
+function loadMask() {
+  const m = new Uint8Array(N);
+  try {
+    const o = JSON.parse(localStorage.getItem('fishhats.mask') || 'null');
+    if (o && o.w === PW && o.h === PH) for (let i = 0; i < N; i++) m[i] = o.d.charCodeAt(i) === 49 ? 1 : 0;
+  } catch (e) {}
+  return m;
+}
+function saveMask() {
+  try { let s = ''; for (let i = 0; i < N; i++) s += mask[i] ? '1' : '0';
+    localStorage.setItem('fishhats.mask', JSON.stringify({ w: PW, h: PH, d: s })); } catch (e) {}
+}
+
+// ---------- screen mapping (video is drawn "cover" style) ----------
+let map = { s: 1, ox: 0, oy: 0, kx: 1, ky: 1 };
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  view.width = Math.round(innerWidth * dpr); view.height = Math.round(innerHeight * dpr);
+  computeMap();
+  initSnow();
+}
+function computeMap() {
+  if (!srcW) return;
+  const s = Math.max(view.width / srcW, view.height / srcH);
+  map = { s, ox: (view.width - srcW * s) / 2, oy: (view.height - srcH * s) / 2, kx: srcW / PW * s, ky: srcH / PH * s };
+}
+const dX = px => map.ox + px * map.kx;
+const dY = py => map.oy + py * map.ky;
+
+// ---------- background model + detection ----------
+function process(now) {
+  pctx.drawImage(source, 0, 0, PW, PH);
+  const d = pctx.getImageData(0, 0, PW, PH).data;
+  lastFrame = d;
+
+  if (learning) {
+    learnFrames++;
+    // sample spread over ~4 s so every fish has swum away from most samples
+    if (now - lastSample > 260) { lastSample = now; samples.push(new Uint8ClampedArray(d)); }
+    statusEl.textContent = 'Learning the tank… keep the phone still (' + Math.min(100, Math.round(samples.length / 15 * 100)) + '%)';
+    if (samples.length >= 15) buildMedian();
+    return;
+  }
+
+  // global brightness offset (phone auto-exposure drifts as fish pass)
+  let sr = 0, sg = 0, sb = 0, c = 0;
+  for (let i = 0; i < N; i += 3) {
+    if (mask[i]) continue; const j = i * 4;
+    sr += d[j] - bgR[i]; sg += d[j + 1] - bgG[i]; sb += d[j + 2] - bgB[i]; c++;
+  }
+  const oR = c ? sr / c : 0, oG = c ? sg / c : 0, oB = c ? sb / c : 0;
+
+  const thr = 130 - S.sens;
+  let fgCount = 0;
+  for (let i = 0; i < N; i++) {
+    const j = i * 4;
+    const r = d[j], g = d[j + 1], b = d[j + 2];
+    let f = 0;
+    if (!mask[i]) {
+      const df = Math.abs(r - oR - bgR[i]) + Math.abs(g - oG - bgG[i]) + Math.abs(b - oB - bgB[i]);
+      f = df > thr ? 1 : 0;
+    }
+    fg[i] = f; fgCount += f;
+    const a = f ? 0.0015 : 0.03;           // learn background slowly under fish, faster elsewhere
+    bgR[i] += (r - bgR[i]) * a; bgG[i] += (g - bgG[i]) * a; bgB[i] += (b - bgB[i]) * a;
+  }
+
+  // whole picture changed: camera bumped or room lights switched
+  if (fgCount > N * 0.4) { if (++bigFgFrames > 25) { relearn(); return; } } else bigFgFrames = 0;
+
+  // close small gaps in each fish: dilate then erode (3x3)
+  morph(fg, tmp, true); morph(tmp, fg2, false);
+  findBlobs();
+  updateTracks(now);
+  statusEl.textContent = '';
+}
+
+function buildMedian() {
+  const k = samples.length, mid = k >> 1, v = new Array(k);
+  for (let i = 0; i < N; i++) {
+    const j = i * 4;
+    for (let ch = 0; ch < 3; ch++) {
+      for (let s = 0; s < k; s++) v[s] = samples[s][j + ch];
+      v.sort((a, b) => a - b);
+      (ch === 0 ? bgR : ch === 1 ? bgG : bgB)[i] = v[mid];
+    }
+  }
+  samples = []; learning = false;
+}
+
+function morph(src, dst, dilate) {
+  for (let y = 0; y < PH; y++) {
+    for (let x = 0; x < PW; x++) {
+      let v = dilate ? 0 : 1;
+      for (let yy = y - 1; yy <= y + 1; yy++) {
+        if (yy < 0 || yy >= PH) { if (!dilate) v = 0; continue; }
+        const row = yy * PW;
+        for (let xx = x - 1; xx <= x + 1; xx++) {
+          if (xx < 0 || xx >= PW) { if (!dilate) v = 0; continue; }
+          const s = src[row + xx];
+          if (dilate) { if (s) { v = 1; break; } } else if (!s) { v = 0; break; }
+        }
+        if (dilate ? v : !v) break;
+      }
+      dst[y * PW + x] = v;
+    }
+  }
+}
+
+function findBlobs() {
+  labels.fill(0); blobs = [];
+  let L = 0;
+  const maxArea = N * 0.25;
+  for (let i0 = 0; i0 < N; i0++) {
+    if (!fg2[i0] || labels[i0]) continue;
+    L++;
+    let sp = 0; stack[sp++] = i0; labels[i0] = L;
+    let area = 0, sx = 0, sy = 0, minx = PW, maxx = 0, miny = PH, maxy = 0;
+    while (sp) {
+      const p = stack[--sp], x = p % PW, y = (p / PW) | 0;
+      area++; sx += x; sy += y;
+      if (x < minx) minx = x; if (x > maxx) maxx = x; if (y < miny) miny = y; if (y > maxy) maxy = y;
+      if (x > 0 && fg2[p - 1] && !labels[p - 1]) { labels[p - 1] = L; stack[sp++] = p - 1; }
+      if (x < PW - 1 && fg2[p + 1] && !labels[p + 1]) { labels[p + 1] = L; stack[sp++] = p + 1; }
+      if (y > 0 && fg2[p - PW] && !labels[p - PW]) { labels[p - PW] = L; stack[sp++] = p - PW; }
+      if (y < PH - 1 && fg2[p + PW] && !labels[p + PW]) { labels[p + PW] = L; stack[sp++] = p + PW; }
+    }
+    const w = maxx - minx + 1, h = maxy - miny + 1;
+    if (area < S.minSize || area > maxArea || w < 3 || h < 2) continue;
+    // top edge of left half and right half: the hat sits on the head side
+    const mid = (minx + maxx) >> 1;
+    let topL = maxy, topR = maxy;
+    for (let y = miny; y <= maxy && (topL === maxy || topR === maxy); y++) {
+      const row = y * PW;
+      if (topL === maxy) for (let x = minx; x <= mid; x++) if (labels[row + x] === L) { topL = y; break; }
+      if (topR === maxy) for (let x = mid; x <= maxx; x++) if (labels[row + x] === L) { topR = y; break; }
+    }
+    blobs.push({ x: sx / area, y: sy / area, w, h, area, minx, maxx, miny, maxy, topL, topR });
+  }
+}
+
+// ---------- tracking ----------
+const ACCS = ['santa', 'santa', 'santa', 'santa', 'elf', 'elf', 'reindeer', 'santa', 'elf', 'reindeer'];
+function updateTracks(now) {
+  const pairs = [];
+  for (let ti = 0; ti < tracks.length; ti++) {
+    const t = tracks[ti], px = t.x + t.vx, py = t.y + t.vy;
+    const gate = Math.max(10, Math.max(t.w, t.h) * 1.1 + 4);
+    for (let bi = 0; bi < blobs.length; bi++) {
+      const b = blobs[bi], dist = Math.hypot(b.x - px, b.y - py);
+      if (dist < gate) pairs.push([dist, ti, bi]);
+    }
+  }
+  pairs.sort((a, b) => a[0] - b[0]);
+  const tUsed = new Uint8Array(tracks.length), bUsed = new Uint8Array(blobs.length);
+  for (const [, ti, bi] of pairs) {
+    if (tUsed[ti] || bUsed[bi]) continue;
+    tUsed[ti] = bUsed[bi] = 1;
+    const t = tracks[ti], b = blobs[bi];
+    t.vx = t.vx * 0.75 + (b.x - t.x) * 0.25;
+    t.vy = t.vy * 0.75 + (b.y - t.y) * 0.25;
+    t.x = b.x; t.y = b.y;
+    // size from area, not box: robust to fins; ignore jumps when two fish merge
+    const sz = Math.sqrt(b.area);
+    if (sz < t.size * 1.35) { t.size += (sz - t.size) * 0.15; t.w += (b.w - t.w) * 0.3; t.h += (b.h - t.h) * 0.3; }
+    if (t.vx > 0.15) t.dir = 1; else if (t.vx < -0.15) t.dir = -1;
+    const top = t.dir > 0 ? b.topR : b.topL;
+    t.top += (top - t.top) * 0.35;
+    t.seen++; t.miss = 0; t.box = b;
+    // a "fish" that never moves is really a ghost in the background: absorb it
+    if (Math.hypot(t.x - t.ax, t.y - t.ay) > 4) { t.ax = t.x; t.ay = t.y; t.at = now; }
+    else if (now - t.at > 5000) { absorb(b); t.dead = true; }
+  }
+  for (let ti = 0; ti < tracks.length; ti++) {
+    if (tUsed[ti]) continue;
+    const t = tracks[ti];
+    t.x += t.vx; t.y += t.vy; t.vx *= 0.9; t.vy *= 0.9; t.miss++;
+    if (t.miss > 40) t.dead = true;
+  }
+  for (let bi = 0; bi < blobs.length; bi++) {
+    if (bUsed[bi]) continue;
+    const b = blobs[bi];
+    tracks.push({ id: nextId++, x: b.x, y: b.y, vx: 0, vy: 0, w: b.w, h: b.h, size: Math.sqrt(b.area), top: b.miny, dir: 1,
+      seen: 1, miss: 0, box: b, ax: b.x, ay: b.y, at: now, sx: b.x, sy: b.y,
+      acc: ACCS[(Math.random() * ACCS.length) | 0], phase: Math.random() * 6.28, born: now });
+  }
+  tracks = tracks.filter(t => !t.dead);
+  for (const t of tracks) { t.sx += (t.x - t.sx) * 0.5; t.sy += (t.top - t.sy) * 0.5; }
+}
+function absorb(b) {
+  const d = lastFrame;
+  for (let y = Math.max(0, b.miny - 2); y <= Math.min(PH - 1, b.maxy + 2); y++)
+    for (let x = Math.max(0, b.minx - 2); x <= Math.min(PW - 1, b.maxx + 2); x++) {
+      const i = y * PW + x, j = i * 4;
+      bgR[i] = d[j]; bgG[i] = d[j + 1]; bgB[i] = d[j + 2];
+    }
+}
+
+// ---------- drawing: hats ----------
+function drawSanta(s, t) {
+  const sway = Math.sin(t * 2.2) * 0.06 * s;
+  const tipX = -0.78 * s + sway, tipY = -0.62 * s;
+  const g = ctx.createLinearGradient(-0.5 * s, -s, 0.5 * s, 0);
+  g.addColorStop(0, '#ff3b3b'); g.addColorStop(1, '#a90f12');
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.moveTo(-0.44 * s, -0.08 * s);
+  ctx.quadraticCurveTo(-0.25 * s, -1.0 * s, tipX, tipY);
+  ctx.quadraticCurveTo(0.3 * s, -1.05 * s, 0.44 * s, -0.08 * s);
+  ctx.closePath(); ctx.fill();
+  // fur brim
+  ctx.fillStyle = '#fff';
+  roundRect(-0.56 * s, -0.2 * s, 1.12 * s, 0.26 * s, 0.13 * s); ctx.fill();
+  ctx.fillStyle = 'rgba(0,0,0,.08)';
+  roundRect(-0.56 * s, -0.04 * s, 1.12 * s, 0.1 * s, 0.05 * s); ctx.fill();
+  // pompom
+  ctx.fillStyle = '#fff';
+  ctx.beginPath(); ctx.arc(tipX, tipY, 0.14 * s, 0, 6.283); ctx.fill();
+}
+function drawElf(s, t) {
+  const sway = Math.sin(t * 2.6) * 0.05 * s;
+  const tipX = -0.55 * s + sway, tipY = -1.15 * s;
+  ctx.fillStyle = '#1f9d43';
+  ctx.beginPath();
+  ctx.moveTo(-0.42 * s, -0.08 * s);
+  ctx.quadraticCurveTo(-0.15 * s, -0.7 * s, tipX, tipY);
+  ctx.quadraticCurveTo(0.25 * s, -0.6 * s, 0.42 * s, -0.08 * s);
+  ctx.closePath(); ctx.fill();
+  // stripe
+  ctx.strokeStyle = '#d32f2f'; ctx.lineWidth = 0.09 * s;
+  ctx.beginPath(); ctx.moveTo(-0.34 * s, -0.45 * s); ctx.quadraticCurveTo(-0.02 * s, -0.55 * s, 0.24 * s, -0.42 * s); ctx.stroke();
+  // band with zigzag
+  ctx.fillStyle = '#d32f2f';
+  ctx.beginPath(); ctx.moveTo(-0.52 * s, -0.2 * s);
+  for (let k = 0; k <= 8; k++) ctx.lineTo(-0.52 * s + k * 0.13 * s, (k % 2 ? 0.08 : -0.02) * s);
+  ctx.lineTo(0.52 * s, -0.2 * s); ctx.closePath(); ctx.fill();
+  // bell
+  ctx.fillStyle = '#ffd54f';
+  ctx.beginPath(); ctx.arc(tipX, tipY, 0.11 * s, 0, 6.283); ctx.fill();
+  ctx.fillStyle = '#b8860b';
+  ctx.beginPath(); ctx.arc(tipX, tipY + 0.04 * s, 0.03 * s, 0, 6.283); ctx.fill();
+}
+function drawAntlers(s) {
+  ctx.strokeStyle = '#7b4a24'; ctx.lineCap = 'round'; ctx.lineWidth = Math.max(2, 0.1 * s);
+  for (const side of [-1, 1]) {
+    const bx = side * 0.22 * s;
+    ctx.beginPath();
+    ctx.moveTo(bx, 0); ctx.quadraticCurveTo(bx + side * 0.05 * s, -0.5 * s, bx + side * 0.35 * s, -0.85 * s);
+    ctx.moveTo(bx + side * 0.04 * s, -0.35 * s); ctx.lineTo(bx + side * 0.32 * s, -0.42 * s);
+    ctx.moveTo(bx + side * 0.15 * s, -0.62 * s); ctx.lineTo(bx - side * 0.04 * s, -0.88 * s);
+    ctx.stroke();
+  }
+}
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+
+function drawTrack(t, time) {
+  if (t.seen < 4) return;
+  const alpha = t.miss < 5 ? 1 : Math.max(0, 1 - (t.miss - 5) / 15);
+  if (alpha <= 0) return;
+  const fade = Math.min(1, (performance.now() - t.born) / 400);
+  const fishH = t.h * map.ky;
+  let s = t.size * map.kx * 0.85 * (S.hat / 100);
+  s = Math.max(14, Math.min(220, s));
+  const hx = dX(t.sx + t.dir * t.w * 0.2), hy = dY(t.sy) + s * 0.14;
+  ctx.save();
+  ctx.globalAlpha = alpha * fade;
+  if (t.acc === 'reindeer') {
+    // red glowing nose at the front of the fish
+    const nx = dX(t.x + t.dir * t.w * 0.5), ny = dY(t.y);
+    const r = Math.max(4, fishH * 0.13);
+    ctx.shadowColor = '#ff2020'; ctx.shadowBlur = r * (1.5 + Math.sin(time * 4 + t.phase));
+    ctx.fillStyle = '#ff2a2a'; ctx.beginPath(); ctx.arc(nx, ny, r, 0, 6.283); ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = 'rgba(255,255,255,.7)'; ctx.beginPath(); ctx.arc(nx - r * 0.3, ny - r * 0.3, r * 0.3, 0, 6.283); ctx.fill();
+  }
+  ctx.translate(hx, hy);
+  ctx.rotate(-t.dir * 0.22 + Math.max(-0.2, Math.min(0.2, t.vy * 0.15)));
+  ctx.scale(t.dir, 1);
+  ctx.shadowColor = 'rgba(0,0,0,.35)'; ctx.shadowBlur = 4; ctx.shadowOffsetY = 2;
+  if (t.acc === 'santa') drawSanta(s, time + t.phase);
+  else if (t.acc === 'elf') drawElf(s, time + t.phase);
+  else drawAntlers(s);
+  ctx.restore();
+}
+
+// ---------- drawing: Christmas extras ----------
+let snow = [];
+function initSnow() {
+  const n = Math.round(Math.min(160, view.width * view.height / 9000));
+  snow = Array.from({ length: n }, () => newFlake(true));
+}
+function newFlake(anyY) {
+  const sc = view.width / 1000;
+  return { x: Math.random() * view.width, y: anyY ? Math.random() * view.height : -10,
+    r: (1.2 + Math.random() * 3.2) * Math.max(1, sc), v: (15 + Math.random() * 35) * Math.max(1, sc),
+    p: Math.random() * 6.28, a: 0.5 + Math.random() * 0.5 };
+}
+function drawSnow(dt, time) {
+  ctx.fillStyle = '#fff';
+  for (const f of snow) {
+    f.y += f.v * dt; f.x += Math.sin(time * 0.8 + f.p) * 12 * dt;
+    if (f.y > view.height + 10) Object.assign(f, newFlake(false));
+    ctx.globalAlpha = f.a;
+    ctx.beginPath(); ctx.arc(f.x, f.y, f.r, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+const BULB = ['#ff3d3d', '#ffd23d', '#3dff6e', '#3db4ff', '#ff6ef0'];
+function drawLights(time) {
+  const W = view.width, sc = Math.max(1, W / 900);
+  const span = 220 * sc, sag = 22 * sc, top = 6 * sc;
+  const yAt = x => top + sag * Math.sin(Math.PI * ((x % span) / span));
+  ctx.strokeStyle = '#173b1c'; ctx.lineWidth = 2.5 * sc;
+  ctx.beginPath(); for (let x = 0; x <= W; x += 6) x ? ctx.lineTo(x, yAt(x)) : ctx.moveTo(x, yAt(x)); ctx.stroke();
+  const step = span / 5;
+  let k = 0;
+  for (let x = step / 2; x < W; x += step, k++) {
+    const y = yAt(x) + 7 * sc, on = 0.45 + 0.55 * Math.max(0, Math.sin(time * 2.5 + k * 1.9));
+    const col = BULB[k % BULB.length];
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = '#2b2b2b'; ctx.fillRect(x - 3 * sc, y - 9 * sc, 6 * sc, 6 * sc);
+    ctx.globalAlpha = 0.35 + 0.65 * on;
+    ctx.shadowColor = col; ctx.shadowBlur = 16 * sc * on;
+    ctx.fillStyle = col;
+    ctx.beginPath(); ctx.ellipse(x, y + 3 * sc, 5.5 * sc, 8 * sc, 0, 0, 6.283); ctx.fill();
+  }
+  ctx.shadowBlur = 0; ctx.globalAlpha = 1;
+}
+function drawBanner(time) {
+  const W = view.width, H = view.height;
+  const fs = Math.round(Math.min(W * 0.075, 64 * Math.max(1, W / 1400)));
+  ctx.font = `800 ${fs}px "Trebuchet MS", system-ui, sans-serif`;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+  const txt = 'Merry Fishmas!';
+  const y = H - fs * 0.6, bob = Math.sin(time * 1.5) * fs * 0.06;
+  ctx.lineWidth = fs * 0.14; ctx.strokeStyle = '#fff'; ctx.lineJoin = 'round';
+  ctx.strokeText(txt, W / 2, y + bob);
+  const g = ctx.createLinearGradient(W / 2 - fs * 4, 0, W / 2 + fs * 4, 0);
+  g.addColorStop(0, '#c62828'); g.addColorStop(0.5, '#2e7d32'); g.addColorStop(1, '#c62828');
+  ctx.fillStyle = g; ctx.fillText(txt, W / 2, y + bob);
+}
+
+// ---------- debug overlay ----------
+const dbg = document.createElement('canvas'), dctx = dbg.getContext('2d');
+function drawDebug() {
+  if (dbg.width !== PW || dbg.height !== PH) { dbg.width = PW; dbg.height = PH; }
+  const im = dctx.createImageData(PW, PH), a = im.data;
+  for (let i = 0; i < N; i++) {
+    const j = i * 4;
+    if (mask[i]) { a[j + 2] = 255; a[j + 3] = 90; }
+    else if (fg2 && fg2[i]) { a[j] = 255; a[j + 1] = 255; a[j + 3] = 120; }
+  }
+  dctx.putImageData(im, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(dbg, map.ox, map.oy, PW * map.kx, PH * map.ky);
+  ctx.imageSmoothingEnabled = true;
+  ctx.strokeStyle = '#0f0'; ctx.lineWidth = 2; ctx.font = '14px monospace'; ctx.fillStyle = '#0f0';
+  for (const t of tracks) {
+    if (!t.box) continue; const b = t.box;
+    ctx.strokeRect(dX(b.minx), dY(b.miny), (b.maxx - b.minx + 1) * map.kx, (b.maxy - b.miny + 1) * map.ky);
+    ctx.fillText('#' + t.id + (t.dir > 0 ? '→' : '←'), dX(b.minx), dY(b.miny) - 4);
+  }
+  ctx.fillStyle = 'rgba(0,0,0,.6)'; ctx.fillRect(6, view.height - 30, 250, 24);
+  ctx.fillStyle = '#0f0';
+  ctx.fillText(`${fps.toFixed(0)} fps · ${blobs.length} blobs · ${tracks.filter(t => t.seen >= 4).length} hats`, 12, view.height - 13);
+}
+function drawMaskOnly() {
+  if (dbg.width !== PW || dbg.height !== PH) { dbg.width = PW; dbg.height = PH; }
+  const im = dctx.createImageData(PW, PH), a = im.data;
+  for (let i = 0; i < N; i++) if (mask[i]) { a[i * 4 + 2] = 255; a[i * 4] = 40; a[i * 4 + 3] = 130; }
+  dctx.putImageData(im, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(dbg, map.ox, map.oy, PW * map.kx, PH * map.ky);
+  ctx.imageSmoothingEnabled = true;
+}
+
+// ---------- main loop ----------
+function frame(now) { requestAnimationFrame(frame); tick(now); }
+// test hook: step the loop by hand (used when the tab is in the background)
+window.__fishStep = (n, ms = 33) => { let t = performance.now(); for (let i = 0; i < n; i++) tick(t += ms); return tracks.filter(t => t.seen >= 4).length; };
+function tick(now) {
+  if (!source) return;
+  const dt = Math.max(0, Math.min(0.1, (now - lastT) / 1000)); lastT = now;
+  if (dt > 0) fps = fps * 0.9 + (1 / dt) * 0.1;
+  const time = now / 1000;
+  if (demo) demo.step(dt, time);
+  const w = demo ? demo.canvas.width : source.videoWidth, h = demo ? demo.canvas.height : source.videoHeight;
+  if (!w || !h) return;
+  if (w !== srcW || h !== srcH) { srcW = w; srcH = h; allocProc(); computeMap(); }
+  frameNo++;
+  process(now);
+
+  ctx.drawImage(source, map.ox, map.oy, srcW * map.s, srcH * map.s);
+  if (S.debug) drawDebug();
+  if (maskMode) drawMaskOnly();
+  if (!learning) for (const t of tracks) drawTrack(t, time);
+  if (S.snow) drawSnow(dt, time);
+  if (S.lights) drawLights(time);
+  if (S.banner) drawBanner(time);
+}
+
+// ---------- camera ----------
+async function startCamera() {
+  const err = $('#startErr');
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    err.textContent = 'This page cannot open the camera here. Chrome only allows the camera on an https:// page (or localhost).';
+    return;
+  }
+  try {
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    stream = await navigator.mediaDevices.getUserMedia({ audio: false,
+      video: { facingMode: { ideal: facing }, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } } });
+    const v = document.createElement('video');
+    v.playsInline = true; v.muted = true; v.srcObject = stream;
+    await v.play();
+    demo = null; source = v; srcW = 0;
+    begin();
+  } catch (e) {
+    err.textContent = 'Camera did not start: ' + (e && e.message ? e.message : e);
+  }
+}
+function startDemo() { demo = makeDemo(); source = demo.canvas; srcW = 0; begin(); }
+function begin() {
+  $('#start').style.display = 'none';
+  goFull(); keepAwake();
+}
+function goFull() { try { const el = document.documentElement; (el.requestFullscreen || el.webkitRequestFullscreen).call(el).catch(() => {}); } catch (e) {} }
+let wakeLock = null;
+async function keepAwake() { try { wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {} }
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && source) keepAwake(); });
+
+// ---------- demo tank (for testing without a phone) ----------
+function makeDemo() {
+  const c = document.createElement('canvas'); c.width = 960; c.height = 540;
+  const g = c.getContext('2d');
+  const bg = document.createElement('canvas'); bg.width = 960; bg.height = 540;
+  const b = bg.getContext('2d');
+  // busy background picture
+  const grd = b.createLinearGradient(0, 0, 0, 540); grd.addColorStop(0, '#2a7fb8'); grd.addColorStop(1, '#0b3550');
+  b.fillStyle = grd; b.fillRect(0, 0, 960, 540);
+  let seed = 7; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  for (let i = 0; i < 260; i++) {
+    b.fillStyle = `hsla(${rnd() * 360},${40 + rnd() * 40}%,${25 + rnd() * 40}%,.55)`;
+    b.beginPath(); b.arc(rnd() * 960, rnd() * 540, 3 + rnd() * 26, 0, 6.283); b.fill();
+  }
+  for (let i = 0; i < 18; i++) { b.fillStyle = `hsl(${20 + rnd() * 30},30%,${30 + rnd() * 20}%)`; b.fillRect(rnd() * 960, 420 + rnd() * 120, 30 + rnd() * 90, 120); }
+  b.fillStyle = '#6d6a75'; b.fillRect(600, 300, 140, 160); b.fillRect(590, 280, 30, 30); b.fillRect(720, 280, 30, 30);
+  b.fillStyle = '#222'; b.fillRect(650, 390, 40, 70);
+  const fish = Array.from({ length: 20 }, () => ({
+    x: rnd() * 960, y: 60 + rnd() * 380, v: (30 + rnd() * 70) * (rnd() < 0.5 ? -1 : 1), L: 28 + rnd() * 40,
+    hue: [10, 30, 50, 200, 280, 330, 0][(rnd() * 7) | 0], p: rnd() * 6.28, turnT: 2 + rnd() * 8 }));
+  const bubbles = Array.from({ length: 25 }, () => ({ x: 850 + rnd() * 20, y: rnd() * 540, r: 2 + rnd() * 5 }));
+  return { canvas: c, step(dt, t) {
+    g.drawImage(bg, 0, 0);
+    // swaying plants (a moving background thing)
+    g.strokeStyle = '#2e8b3a'; g.lineWidth = 8;
+    for (let k = 0; k < 5; k++) { const px = 80 + k * 30; g.beginPath(); g.moveTo(px, 540);
+      g.quadraticCurveTo(px + Math.sin(t + k) * 20, 440, px + Math.sin(t * 1.3 + k) * 30, 340); g.stroke(); }
+    for (const bb of bubbles) { bb.y -= 90 * dt; if (bb.y < -10) bb.y = 545;
+      g.strokeStyle = 'rgba(255,255,255,.8)'; g.lineWidth = 1.5; g.beginPath(); g.arc(bb.x + Math.sin(bb.y / 20) * 3, bb.y, bb.r, 0, 6.283); g.stroke(); }
+    for (const f of fish) {
+      f.turnT -= dt; if (f.turnT < 0) { f.v = -f.v; f.turnT = 3 + Math.random() * 8; }
+      f.x += f.v * dt; f.y += Math.sin(t * 0.9 + f.p) * 12 * dt;
+      if (f.x < 20) f.v = Math.abs(f.v); if (f.x > 940) f.v = -Math.abs(f.v);
+      const dir = Math.sign(f.v), L = f.L, H = L * 0.45;
+      g.save(); g.translate(f.x, f.y); g.scale(dir, 1);
+      g.fillStyle = `hsl(${f.hue},85%,55%)`;
+      g.beginPath(); g.ellipse(0, 0, L / 2, H / 2, 0, 0, 6.283); g.fill();
+      const wag = Math.sin(t * 10 + f.p) * H * 0.15;
+      g.beginPath(); g.moveTo(-L * 0.42, 0); g.lineTo(-L * 0.75, -H * 0.5 + wag); g.lineTo(-L * 0.75, H * 0.5 + wag); g.closePath(); g.fill();
+      g.fillStyle = '#fff'; g.beginPath(); g.arc(L * 0.28, -H * 0.1, H * 0.13, 0, 6.283); g.fill();
+      g.fillStyle = '#000'; g.beginPath(); g.arc(L * 0.3, -H * 0.1, H * 0.07, 0, 6.283); g.fill();
+      g.restore();
+    }
+    // slight exposure flicker, like a real phone camera
+    g.fillStyle = `rgba(0,0,0,${0.03 + 0.03 * Math.sin(t * 0.7)})`; g.fillRect(0, 0, 960, 540);
+  } };
+}
+
+// ---------- UI ----------
+const panel = $('#panel');
+let maskMode = false, maskErase = false, painting = false;
+function bindRange(id, key) { const el = $(id); el.value = S[key]; el.oninput = () => { S[key] = +el.value; saveS(); }; }
+function bindCheck(id, key) { const el = $(id); el.checked = S[key]; el.onchange = () => { S[key] = el.checked; saveS(); }; }
+bindRange('#sSens', 'sens'); bindRange('#sMin', 'minSize'); bindRange('#sHat', 'hat');
+bindCheck('#sSnow', 'snow'); bindCheck('#sLights', 'lights'); bindCheck('#sBanner', 'banner'); bindCheck('#sDebug', 'debug');
+$('#bRelearn').onclick = () => { relearn(); panel.classList.remove('show'); };
+$('#bClose').onclick = () => panel.classList.remove('show');
+$('#bFull').onclick = goFull;
+$('#bFlip').onclick = () => { if (demo) return; facing = facing === 'environment' ? 'user' : 'environment'; startCamera(); };
+$('#bClearMask').onclick = () => { if (mask) { mask.fill(0); saveMask(); } };
+$('#bMask').onclick = () => { maskMode = true; maskErase = false; panel.classList.remove('show'); $('#maskbar').classList.add('show'); setMaskBtns();
+  statusEl.textContent = 'Paint over bubbles, filter flow and waving plants'; };
+$('#mPaint').onclick = () => { maskErase = false; setMaskBtns(); };
+$('#mErase').onclick = () => { maskErase = true; setMaskBtns(); };
+$('#mDone').onclick = () => { maskMode = false; $('#maskbar').classList.remove('show'); saveMask(); statusEl.textContent = ''; tracks = []; };
+function setMaskBtns() { $('#mPaint').className = maskErase ? 'ghost' : 'alt'; $('#mErase').className = maskErase ? 'alt' : 'ghost'; }
+function paintAt(e) {
+  const r = view.getBoundingClientRect(), sx = view.width / r.width, sy = view.height / r.height;
+  const px = ((e.clientX - r.left) * sx - map.ox) / map.kx, py = ((e.clientY - r.top) * sy - map.oy) / map.ky;
+  const rad = 5;
+  for (let y = Math.floor(py - rad); y <= py + rad; y++) for (let x = Math.floor(px - rad); x <= px + rad; x++) {
+    if (x < 0 || y < 0 || x >= PW || y >= PH) continue;
+    if ((x - px) ** 2 + (y - py) ** 2 <= rad * rad) mask[y * PW + x] = maskErase ? 0 : 1;
+  }
+}
+view.addEventListener('pointerdown', e => {
+  if (!source) return;
+  if (maskMode) { painting = true; paintAt(e); return; }
+  panel.classList.toggle('show');
+});
+view.addEventListener('pointermove', e => { if (maskMode && painting) paintAt(e); });
+addEventListener('pointerup', () => { painting = false; });
+$('#goCam').onclick = startCamera;
+$('#goDemo').onclick = startDemo;
+addEventListener('resize', resize);
+resize();
+requestAnimationFrame(frame);
+if (location.hash === '#demo') startDemo();
+})();
+</script>
+</body>
+</html>
